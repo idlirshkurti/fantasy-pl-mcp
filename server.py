@@ -15,14 +15,14 @@ from typing import AsyncGenerator, Any, Dict
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
-# Import the FPL MCP server implementation
-# The package exposes a create_mcp_server() factory in __main__.py
-from fpl_mcp.__main__ import create_mcp_server  # type: ignore[attr-defined]
+# Import the FPL MCP server implementation from the installed package
+import fpl_mcp.__main__ as fpl_main  # type: ignore[attr-defined]
 
 app = FastAPI(title="Fantasy PL MCP Server")
 
-# Initialize the MCP server instance
-mcp_server = create_mcp_server()
+# Get the MCP server instance from the package's main
+# The package creates a server instance when imported
+mcp_server = fpl_main.server  # type: ignore[attr-defined]
 
 
 @app.get("/health")
@@ -38,10 +38,10 @@ async def sse_endpoint(request: Request) -> StreamingResponse:
     """
 
     async def event_generator() -> AsyncGenerator[str, None]:
-        # Stream MCP events; adapt to the actual MCP SSE transport API.
-        # If the package exposes a different API, adjust accordingly.
-        async for event in mcp_server.sse_stream():
-            yield f"event: message\ndata: {json.dumps(event)}\n\n"
+        # Stream MCP events via the server's SSE transport
+        async with mcp_server.sse_stream() as stream:
+            async for event in stream:
+                yield f"event: message\ndata: {json.dumps(event)}\n\n"
 
     return StreamingResponse(
         event_generator(),
