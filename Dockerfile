@@ -3,9 +3,9 @@ FROM python:3.11-slim
 # Cache-bust: 2026-08-17 force rebuild
 WORKDIR /app
 
-# Install system deps if needed (none required for this simple app)
+# Install system deps including git
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
+    curl git \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
