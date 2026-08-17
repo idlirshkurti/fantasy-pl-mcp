@@ -74,8 +74,16 @@ async def public_team(team_id, gameweek):
             except (TypeError, ValueError):
                 raise ValueError("gameweek must be an integer")
 
-        response = await client.get(f"{FPL_API}/entry/{team_id}/event/{gameweek}/picks/")
-        response.raise_for_status()
+        try:
+            response = await client.get(f"{FPL_API}/entry/{team_id}/event/{gameweek}/picks/")
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # Attach the resolved, non-sensitive lookup identifiers so the
+            # caller can log the actual gameweek used (not the original
+            # possibly-None value supplied by the MCP client).
+            exc.gateway_team_id = team_id
+            exc.gateway_gameweek = gameweek
+            raise
         data = response.json()
 
     return {"team_id": team_id, "gameweek": gameweek, **data}
@@ -197,6 +205,14 @@ async def mcp(request: Request):
             return error(request_id, -32602, str(exc), 400)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
+            resolved_team_id = getattr(exc, "gateway_team_id", team_id)
+            resolved_gameweek = getattr(exc, "gateway_gameweek", arguments.get("gameweek"))
+            log.warning(
+                "FPL public team lookup returned HTTP %s for team_id=%s gameweek=%s",
+                status,
+                resolved_team_id,
+                resolved_gameweek,
+            )
             message = "FPL team or gameweek was not found" if status == 404 else f"FPL API returned HTTP {status}"
             return error(request_id, -32603, message, 502)
         except Exception as exc:
