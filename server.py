@@ -1,6 +1,9 @@
 """
 FastAPI HTTP/SSE wrapper for fantasy-pl-mcp to run on Render.
 
+This creates a minimal MCP server using the mcp library and registers
+FPL tools/resources by wrapping the fpl_mcp.fpl.api functions.
+
 Endpoints:
   GET  /sse    — Server-Sent Events stream for MCP clients that support SSE.
   POST /mcp    — JSON-RPC style endpoint for Streamable HTTP MCP clients.
@@ -10,19 +13,68 @@ Endpoints:
 import asyncio
 import json
 import os
-from typing import AsyncGenerator, Any, Dict
+from typing import AsyncGenerator, Any, Dict, List
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
-# Import the FPL MCP server implementation from the installed package
-import fpl_mcp.__main__ as fpl_main  # type: ignore[attr-defined]
+from mcp.server import Server  # type: ignore
+from mcp.types import Tool, Resource  # type: ignore
+
+# Import FPL API functions
+from fpl_mcp.fpl.api import FplApi  # type: ignore[attr-defined]
 
 app = FastAPI(title="Fantasy PL MCP Server")
 
-# Get the MCP server instance from the package's main
-# The package creates a server instance when imported
-mcp_server = fpl_main.server  # type: ignore[attr-defined]
+# Create MCP server instance
+mcp_server = Server(name="fantasy-pl")
+
+# Initialize FPL API (handles auth internally)
+fpl_api = FplApi()
+
+
+# Register simple tools
+@mcp_server.tool(
+    name="get_players",
+    description="Get all FPL players with stats",
+)
+async def get_players() -> List[Dict[str, Any]]:
+    return await fpl_api.get_players()
+
+
+@mcp_server.tool(
+    name="get_fixtures",
+    description="Get FPL fixtures",
+)
+async def get_fixtures() -> List[Dict[str, Any]]:
+    return await fpl_api.get_fixtures()
+
+
+@mcp_server.tool(
+    name="get_gameweeks",
+    description="Get FPL gameweek status",
+)
+async def get_gameweeks() -> List[Dict[str, Any]]:
+    return await fpl_api.get_gameweeks()
+
+
+# Register resources
+@mcp_server.resource(
+    uri="fpl://players",
+    name="FPL Players",
+    description="All FPL players",
+)
+async def players_resource() -> List[Dict[str, Any]]:
+    return await fpl_api.get_players()
+
+
+@mcp_server.resource(
+    uri="fpl://fixtures",
+    name="FPL Fixtures",
+    description="All FPL fixtures",
+)
+async def fixtures_resource() -> List[Dict[str, Any]]:
+    return await fpl_api.get_fixtures()
 
 
 @app.get("/health")
@@ -34,11 +86,9 @@ async def health() -> dict[str, str]:
 async def sse_endpoint(request: Request) -> StreamingResponse:
     """
     Server-Sent Events endpoint for MCP clients that expect an SSE stream.
-    Yields MCP events as they are produced by the server.
     """
 
     async def event_generator() -> AsyncGenerator[str, None]:
-        # Stream MCP events via the server's SSE transport
         async with mcp_server.sse_stream() as stream:
             async for event in stream:
                 yield f"event: message\ndata: {json.dumps(event)}\n\n"
@@ -57,7 +107,6 @@ async def sse_endpoint(request: Request) -> StreamingResponse:
 async def mcp_endpoint(request: Request) -> JSONResponse:
     """
     JSON-RPC style endpoint for Streamable HTTP MCP clients.
-    Accepts a JSON-RPC request body and returns the MCP response.
     """
     body = await request.json()
     result = await mcp_server.handle_json_rpc(body)
