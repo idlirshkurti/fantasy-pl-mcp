@@ -1,395 +1,137 @@
-# Fantasy Premier League MCP Server
+# Fantasy Premier League MCP Gateway
 
-[![PyPI version](https://badge.fury.io/py/fpl-mcp.svg)](https://badge.fury.io/py/fpl-mcp)
-[![Package Check](https://github.com/rishijatia/fantasy-pl-mcp/actions/workflows/package-check.yml/badge.svg)](https://github.com/rishijatia/fantasy-pl-mcp/actions/workflows/package-check.yml)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/fpl-mcp)](https://pypi.org/project/fpl-mcp/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Downloads](https://static.pepy.tech/badge/fpl-mcp)](https://pepy.tech/project/fpl-mcp)
+A hosted **Model Context Protocol (MCP) gateway** for Fantasy Premier League (FPL) data, deployed as a remote HTTP API. This repository is a fork of [rishijatia/fantasy-pl-mcp](https://github.com/rishijatia/fantasy-pl-mcp), which is a local, stdio-based MCP server for Claude Desktop. **This fork changes the delivery model**: instead of spawning `fpl_mcp` directly inside a desktop client, it wraps that same package behind a FastAPI gateway (`server.py`) that any MCP-compatible client can reach over plain HTTPS, with bearer-token authentication and Render-based deployment.
 
-[![Trust Score](https://archestra.ai/mcp-catalog/api/badge/quality/rishijatia/fantasy-pl-mcp)](https://archestra.ai/mcp-catalog/rishijatia__fantasy-pl-mcp)
-<a href="https://glama.ai/mcp/servers/2zxsxuxuj9">
-  <img width="380" height="200" src="https://glama.ai/mcp/servers/2zxsxuxuj9/badge" />
+If you want the original local/stdio server for Claude Desktop, use the upstream project directly. Use this fork if you want to run FPL tools as a shared, remotely-hosted MCP endpoint (e.g. for the Perplexity MCP connector, a team-shared Claude/Cursor setup, or any other Streamable-HTTP MCP client).
 
-A Model Context Protocol (MCP) server that provides access to Fantasy Premier League (FPL) data and tools. This server allows you to interact with FPL data in Claude for Desktop and other MCP-compatible clients.
+## Architecture
 
-*Demo of the Fantasy Premier League MCP Server in action*
+```
+MCP client (Perplexity, Claude, Cursor, ...)
+        │  HTTPS, Bearer <MCP_API_TOKEN>
+        ▼
+   FastAPI gateway (server.py)
+        │
+        ├─ get_team / get_my_team / get_my_current_team
+        │      → served directly from the public FPL API
+        │        (https://fantasy.premierleague.com/api/entry/{id}/event/{gw}/picks/)
+        │
+        └─ everything else (analyze_players, compare_players,
+           get_gameweek_status, resources, prompts, ...)
+               → proxied over stdio to a managed `python -m fpl_mcp`
+                 subprocess (the unmodified upstream package)
+```
 
-[![Fantasy Premier League MCP Demo](https://img.youtube.com/vi/QfOOOQ_jeMA/0.jpg)](https://youtu.be/QfOOOQ_jeMA)
+The gateway does two things the upstream package doesn't:
 
+1. **Remote HTTP transport** — exposes a single `POST /mcp` JSON-RPC 2.0 endpoint and a `GET /health` liveness check, instead of requiring a local process spawn.
+2. **Safety controls** — enforces a bearer token on every `/mcp` request, blocks the `update_fpl_credentials` tool from being called remotely, and (for the intercepted team-lookup tools) logs only non-sensitive diagnostics — upstream FPL HTTP status, numeric team ID, and resolved gameweek — on failure, never credentials, tokens, headers, or response bodies.
 
-## Supported Platforms
+## Deployment
 
-- Claude Desktop
-- Cursor
-- Windsurf
-- Other MCP Compatible Desktop LLMs
+This service is deployed on [Render](https://render.com) via Docker. See [`render.md`](./render.md) and the [`Dockerfile`](./Dockerfile) for the full deployment configuration, including PR-preview environments that let you validate changes on a live URL before merging.
 
-Mobile is currently not supported.
+### Required environment variables
 
-## Features
+| Variable | Purpose |
+|---|---|
+| `MCP_API_TOKEN` | Bearer token required on every `POST /mcp` request to this gateway. |
+| `FPL_TEAM_ID` | Default team ID used by `get_my_team` / `get_my_current_team`. |
+| `FPL_EMAIL` / `FPL_PASSWORD` (or refresh token, per upstream auth flow) | Credentials the underlying `fpl_mcp` subprocess uses for tools that need authenticated FPL access (e.g. `get_manager_info`). Not required for the public team-lookup tools. |
+| `PORT` | Port the gateway listens on (defaults to `8000`; Render sets this automatically). |
 
-- **Rich Player Data**: Access comprehensive player statistics from the FPL API
-- **Team Information**: Get details about Premier League teams
-- **Gameweek Data**: View current and past gameweek information
-- **Player Search**: Find players by name or team
-- **Player Comparison**: Compare detailed statistics between any two players
-
-## Requirements
-
-- Python 3.10 or higher
-- Claude Desktop (for AI integration)
-
-## Installation
-
-### Option 1: Install from PyPI (Recommended)
+### Running locally
 
 ```bash
-pip install fpl-mcp
+pip install -r requirements.txt
+export MCP_API_TOKEN=some-local-secret
+python server.py
 ```
 
-### Option 1b: Install with Development Dependencies
+Then call it like any HTTP MCP server:
 
 ```bash
-pip install "fpl-mcp[dev]"
+curl -X POST http://localhost:8000/mcp \
+  -H "Authorization: Bearer some-local-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-### Option 2: Install from GitHub
+## Endpoints
 
-```bash
-pip install git+https://github.com/rishijatia/fantasy-pl-mcp.git
-```
+- `GET /health` — liveness probe, returns `{"status": "ok"}`. No authentication required.
+- `POST /mcp` — the MCP JSON-RPC 2.0 endpoint. Requires `Authorization: Bearer <MCP_API_TOKEN>`. Supports `initialize`, `notifications/initialized`, `tools/list`, `tools/call`, and (via subprocess proxy) `resources/list`, `resources/read`, `prompts/list`, `prompts/get`.
 
-### Option 3: Clone and Install Locally
+## Authentication model
 
-```bash
-git clone https://github.com/rishijatia/fantasy-pl-mcp.git
-cd fantasy-pl-mcp
-pip install -e .
-```
+There are two independent layers of authentication, and they're easy to conflate:
 
-## Running the Server
+1. **Gateway auth** — the `Authorization: Bearer <MCP_API_TOKEN>` header required to reach this service at all. Set by you, checked on every `/mcp` request.
+2. **FPL account auth** — the `FPL_EMAIL`/`FPL_PASSWORD` (or refresh token) credentials the *underlying* `fpl_mcp` package uses to call authenticated FPL endpoints (e.g. `get_manager_info`). These live on the server, never in the request, and the `update_fpl_credentials` tool that would normally let a client update them remotely is explicitly **blocked** by this gateway — it must be changed by editing server environment variables directly, not via any MCP client.
 
-After installation, you have several options to run the server:
+The three team-lookup tools (`get_team`, `get_my_team`, `get_my_current_team`) bypass the `fpl_mcp` subprocess entirely and call FPL's public `/api/entry/{id}/event/{gw}/picks/` endpoint directly, since that data doesn't require FPL account authentication.
 
-### 1. Using the CLI command
+## Available tools
 
-```bash
-fpl-mcp
-```
+These come from the unmodified upstream `fpl_mcp` package; everything except the first three is proxied through as-is.
 
-### 2. Using the Python module
+**Intercepted by the gateway (served from the public FPL API directly):**
+- `get_team` — view any team by ID.
+- `get_my_team` — view your own team (uses `FPL_TEAM_ID`).
+- `get_my_current_team` — view your own team for the current gameweek.
 
-```bash
-python -m fpl_mcp
-```
+**Proxied to the `fpl_mcp` subprocess:**
+- `get_gameweek_status` — current, previous, and next gameweek info.
+- `analyze_player_fixtures` — fixture difficulty for a specific player.
+- `get_blank_gameweeks` / `get_double_gameweeks` — upcoming blank/double gameweeks.
+- `analyze_players` — filter/analyze players by multiple criteria.
+- `analyze_fixtures` — fixture difficulty for players, teams, or positions.
+- `compare_players` — compare multiple players across metrics.
+- `check_fpl_authentication` — verify the server's FPL credentials work.
+- `get_manager_info` — manager details (requires FPL account auth).
 
-### 3. Using with Claude Desktop
+## Available resources & prompt templates
 
-Configure Claude Desktop to use the installed package by editing your `claude_desktop_config.json` file:
+Also proxied through unchanged from `fpl_mcp`:
 
-**Method 1: Using the Python module directly (most reliable)**
+**Resources:** `fpl://static/players`, `fpl://static/players/{name}`, `fpl://static/teams`, `fpl://static/teams/{name}`, `fpl://gameweeks/current`, `fpl://gameweeks/all`, `fpl://fixtures`, `fpl://fixtures/gameweek/{gameweek_id}`, `fpl://fixtures/team/{team_name}`, `fpl://players/{player_name}/fixtures`, `fpl://gameweeks/blank`, `fpl://gameweeks/double`.
 
-```json
-{
-  "mcpServers": {
-    "fantasy-pl": {
-      "command": "python",
-      "args": ["-m", "fpl_mcp"]
-    }
-  }
-}
-```
+**Prompt templates:** `player_analysis_prompt`, `transfer_advice_prompt`, `team_rating_prompt`, `differential_players_prompt`, `chip_strategy_prompt`.
 
-**Method 2: Using the installed command with full path (if installed with pip)**
+## Security notes
 
-```json
-{
-  "mcpServers": {
-    "fantasy-pl": {
-      "command": "/full/path/to/your/venv/bin/fpl-mcp"
-    }
-  }
-}
-```
-
-Replace `/full/path/to/your/venv/bin/fpl-mcp` with the actual path to the executable. You can find this by running `which fpl-mcp` in your terminal after activating your virtual environment.
-
-> **Note:** Using just `"command": "fpl-mcp"` may result in a `spawn fpl-mcp ENOENT` error since Claude Desktop might not have access to your virtual environment's PATH. Using the full path or the Python module approach helps avoid this issue.
-
-## Usage
-
-### In Claude for Desktop
-
-1. Start Claude for Desktop
-2. You should see FPL tools available via the hammer icon
-3. Example queries:
-   - "Compare Mohamed Salah and Erling Haaland over the last 5 gameweeks"
-   - "Find all Arsenal midfielders"
-   - "What's the current gameweek status?"
-   - "Show me the top 5 forwards by points"
-
-#### Fantasy-PL MCP Usage Instructions
-
-#### Basic Commands:
-- Compare players: "Compare [Player1] and [Player2]"
-- Find players: "Find players from [Team]" or "Search for [Player Name]"
-- Fixture difficulty: "Show upcoming fixtures for [Team]"
-- Captain advice: "Who should I captain between [Player1] and [Player2]?"
-
-#### Advanced Features:
-- Statistical analysis: "Compare underlying stats for [Player1] and [Player2]"
-- Form check: "Show me players in form right now"
-- Differential picks: "Suggest differentials under 10% ownership"
-- Team optimization: "Rate my team and suggest transfers"
-
-#### Tips:
-- Be specific with player names for accurate results
-- Include positions when searching (FWD, MID, DEF, GK)
-- For best captain advice, ask about form, fixtures, and underlying stats
-- Request comparison of specific metrics (xG, shots in box, etc.   
-
-### MCP Inspector for Development
-
-For development and testing:
-
-```bash
-# If you have mcp[cli] installed
-mcp dev -m fpl_mcp
-
-# Or use npx
-npx @modelcontextprotocol/inspector python -m fpl_mcp
-```
-
-## Available Resources
-- `fpl://static/players` - All player data with comprehensive statistics
-- `fpl://static/players/{name}` - Player data by name search
-- `fpl://static/teams` - All Premier League teams
-- `fpl://static/teams/{name}` - Team data by name search
-- `fpl://gameweeks/current` - Current gameweek data
-- `fpl://gameweeks/all` - All gameweeks data
-- `fpl://fixtures` - All fixtures for the current season
-- `fpl://fixtures/gameweek/{gameweek_id}` - Fixtures for a specific gameweek
-- `fpl://fixtures/team/{team_name}` - Fixtures for a specific team
-- `fpl://players/{player_name}/fixtures` - Upcoming fixtures for a specific player
-- `fpl://gameweeks/blank` - Information about upcoming blank gameweeks
-- `fpl://gameweeks/double` - Information about upcoming double gameweeks
-
-## Available Tools
-
-### Players
-- `search_fpl_players` - Search for players by name, with optional position and team filters
-- `get_player_information` - Get detailed information and gameweek history for a player
-- `analyze_players` - Filter and analyze FPL players based on multiple criteria
-- `compare_players` - Compare multiple players across various metrics
-- `get_price_changes` - Get players whose price rose or fell in the current gameweek
-
-### Fixtures and gameweeks
-- `get_gameweek_status` - Get precise information about current, previous, and next gameweeks
-- `analyze_player_fixtures` - Analyze upcoming fixtures for a player with difficulty ratings
-- `analyze_fixtures` - Analyze upcoming fixtures for players, teams, or positions
-- `get_blank_gameweeks` - Get information about upcoming blank gameweeks
-- `get_double_gameweeks` - Get information about upcoming double gameweeks
-
-### Live gameweek
-- `get_gameweek_live_scores` - Live player points and stats while matches are being played
-- `get_dream_team` - The official highest-scoring XI for a gameweek
-
-### Your team and advice
-- `suggest_captain` - Rank your squad by captain score with per-component reasoning
-- `check_fpl_authentication` - Check if FPL authentication is working correctly
-- `update_fpl_credentials` - Update your stored FPL credentials from within a chat
-- `get_my_team` - View your authenticated team (requires authentication)
-- `get_my_current_team` - View your current team for the active gameweek (requires authentication)
-- `get_team` - View any team with a specific ID (requires authentication)
-- `get_manager` - Get manager details for a specific team ID (requires authentication)
-- `get_manager_info` - Get manager details (requires authentication)
-- `get_manager_transfer_history` - Get a manager's full transfer history
-
-### Leagues
-- `get_league_standings` - Get standings for a classic league (requires authentication)
-- `get_league_analytics` - Analyze a league's managers, ownership trends, and performance
-
-## Prompt Templates
-- `player_analysis_prompt` - Create a prompt for analyzing an FPL player in depth
-- `transfer_advice_prompt` - Get advice on player transfers based on budget and position
-- `team_rating_prompt` - Create a prompt for rating and analyzing an FPL team
-- `differential_players_prompt` - Create a prompt for finding differential players with low ownership
-- `chip_strategy_prompt` - Create a prompt for chip strategy advice
-
-## Development
-
-### Adding Features
-
-To add new features:
-
-1. Add resource handlers in the appropriate file within `fpl_mcp/fpl/resources/`
-2. Add tool handlers in the appropriate file within `fpl_mcp/fpl/tools/`
-3. Update the `__main__.py` file to register new resources and tools
-4. Test using the MCP Inspector before deploying to Claude for Desktop
-
-## Authentication
-
-FPL migrated its login to PingOne (Ping Identity) OIDC, so authentication now uses an OIDC
-**refresh token** rather than your email and password. The refresh token is exchanged for
-short-lived access tokens automatically, and requests are sent with an
-`X-API-Authorization: Bearer` header.
-
-To use features requiring authentication (like accessing your team or private leagues), set up
-your refresh token:
-
-```bash
-# Run the credential setup tool
-fpl-mcp-config setup
-```
-
-This interactive tool will:
-1. Show you how to copy your OIDC refresh token from the browser
-2. Prompt for the refresh token and your team ID
-3. Save them (encrypted) to `~/.fpl-mcp/credentials.enc`
-
-**Getting your refresh token:**
-1. Log in at https://fantasy.premierleague.com in your browser.
-2. Open the DevTools Console (F12 → Console) and run:
-   ```js
-   copy(JSON.parse(localStorage.getItem(Object.keys(localStorage).find(k=>k.startsWith('oidc.user:')))).refresh_token)
-   ```
-   (If Chrome refuses, type `allow pasting` in the console first.) The refresh
-   token is now on your clipboard — paste it when prompted.
-3. Alternatively: DevTools → Application → Local storage →
-   `https://fantasy.premierleague.com`, copy the whole JSON value of the key
-   starting with `oidc.user:` and paste that instead — setup extracts the
-   `refresh_token` field automatically.
-
-Run `fpl-mcp-config test` right after setup: the first exchange claims the token
-before your browser session can supersede it, and rotates it so the copy in your
-browser is retired — that is expected, and your browser session recovers on its own.
-
-You can test your authentication with:
-```bash
-fpl-mcp-config test
-```
-
-Alternatively, you can manually configure authentication:
-1. Create `~/.fpl-mcp/.env` file with:
-   ```
-   FPL_REFRESH_TOKEN=your_refresh_token
-   FPL_TEAM_ID=your_team_id
-   ```
-
-2. Or create `~/.fpl-mcp/config.json`:
-   ```json
-   {
-     "refresh_token": "your_refresh_token",
-     "team_id": "your_team_id"
-   }
-   ```
-
-3. Or set environment variables:
-   ```bash
-   export FPL_REFRESH_TOKEN=your_refresh_token
-   export FPL_TEAM_ID=your_team_id
-   ```
-
-> Note: refresh tokens can be rotated or revoked by FPL. If authentication starts failing,
-> re-run `fpl-mcp-config setup` with a freshly copied token.
-
-### Advanced: overriding the OIDC endpoints
-
-If FPL changes its OIDC client or endpoints, you can override the defaults with environment
-variables (all optional):
-
-| Variable | Default |
-| --- | --- |
-| `FPL_OIDC_CLIENT_ID` | `1f243d70-a140-4035-8c41-341f5af5aa12` |
-| `FPL_OIDC_AUTHORITY` | `https://account.premierleague.com/as` |
-| `FPL_TOKEN_URL` | `<FPL_OIDC_AUTHORITY>/token` |
+- Every `/mcp` request must present a valid bearer token; requests without one get a `401` with a `WWW-Authenticate: Bearer` header.
+- `update_fpl_credentials` is never reachable through this gateway, in `tools/list` or `tools/call`, regardless of caller.
+- Diagnostic logging for failed public team lookups is limited to the upstream FPL HTTP status code, the numeric team ID, and the resolved gameweek — never `MCP_API_TOKEN`, `FPL_EMAIL`, `FPL_PASSWORD`, refresh/access tokens, authorization headers, request bodies, or FPL response bodies.
+- The `fpl_mcp` subprocess is managed through the FastAPI app lifespan: it's started once at boot, its stderr is drained and logged, and it's terminated (with a kill fallback) on shutdown.
 
 ## Limitations
 
-- The FPL API is not officially documented and may change without notice
-- Only read operations are currently supported
+- The FPL API is not officially documented and may change without notice.
+- Only read operations are currently supported.
+- Public team-lookup tools depend on FPL having published picks for the requested gameweek — during preseason or before a gameweek's deadline, every team lookup will correctly 404 because no picks exist yet, not because of a bug in this gateway.
 
-## Troubleshooting
+## Local/legacy usage (Claude Desktop, stdio)
 
-### Common Issues
+The underlying `fpl_mcp` package can still be run locally exactly as documented upstream, independent of this gateway, if you want a desktop-only setup:
 
-#### 1. "spawn fpl-mcp ENOENT" error in Claude Desktop
+```bash
+pip install fpl-mcp
+python -m fpl_mcp
+```
 
-This occurs because Claude Desktop cannot find the `fpl-mcp` executable in its PATH.
-
-**Solution:** Use one of these approaches:
-
-- Use the full path to the executable in your config file
-  ```json
-  {
-    "mcpServers": {
-      "fantasy-pl": {
-        "command": "/full/path/to/your/venv/bin/fpl-mcp"
-      }
-    }
-  }
-  ```
-
-- Use Python to run the module directly (preferred method)
-  ```json
-  {
-    "mcpServers": {
-      "fantasy-pl": {
-        "command": "python",
-        "args": ["-m", "fpl_mcp"]
-      }
-    }
-  }
-  ```
-
-#### 2. Server disconnects immediately
-
-If the server starts but immediately disconnects:
-
-- Check logs at `~/Library/Logs/Claude/mcp*.log` (macOS) or `%APPDATA%\Claude\logs\mcp*.log` (Windows)
-- Ensure all dependencies are installed
-- Try running the server manually with `python -m fpl_mcp` to see any errors
-
-#### 3. Server not showing in Claude Desktop
-
-If the hammer icon doesn't appear:
-
-- Restart Claude Desktop completely
-- Verify your `claude_desktop_config.json` has correct JSON syntax
-- Ensure the path to Python or the executable is absolute, not relative
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+See [rishijatia/fantasy-pl-mcp](https://github.com/rishijatia/fantasy-pl-mcp) for the full local installation, Claude Desktop configuration, and troubleshooting guide for that mode.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome — please see [`CONTRIBUTING.md`](./CONTRIBUTING.md). Changes to `server.py` should go through a feature branch and pull request, validated against a Render PR-preview deployment before merging.
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+## License
 
-For more details, please refer to the [CONTRIBUTING.md](CONTRIBUTING.md) file.
+This project is licensed under the MIT License — see the [`LICENSE`](./LICENSE) file for details.
 
 ## Acknowledgments
 
-- [Fantasy Premier League API](https://fantasy.premierleague.com/api/) for providing the data
-- [Model Context Protocol](https://modelcontextprotocol.io/) for the connectivity standard
-- [Claude](https://claude.ai/) for the AI assistant capabilities
-
-## Citation
-
-If you use this package in your research or project, please consider citing it:
-
-```bibtex
-@software{fpl_mcp,
-  author = {Jatia, Rishi and Fantasy PL MCP Contributors},
-  title = {Fantasy Premier League MCP Server},
-  url = {https://github.com/rishijatia/fantasy-pl-mcp},
-  version = {0.1.0},
-  year = {2025},
-}
-```
+- [rishijatia/fantasy-pl-mcp](https://github.com/rishijatia/fantasy-pl-mcp) for the original FPL MCP server and all of its tools, resources, and prompt templates, which this gateway wraps unmodified.
+- Fantasy Premier League API for providing the underlying data.
+- Model Context Protocol for the connectivity standard.
