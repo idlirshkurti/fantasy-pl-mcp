@@ -1,38 +1,32 @@
 """
-Minimal MCP HTTP/SSE server using FastMCP.
-
-This avoids importing fpl_mcp internals and just demonstrates the pattern works.
-We can add real FPL tools once we confirm the server starts.
+MCP HTTP/SSE server for Fantasy PL with plain FastAPI + sse_starlette.
 
 Endpoints:
-  GET  /sse    — Server-Sent Events stream for MCP clients that support SSE.
-  POST /mcp    — JSON-RPC style endpoint for Streamable HTTP MCP clients.
+  GET  /sse    — Server-Sent Events stream (MCP-style messages).
+  POST /mcp    — JSON-RPC: {"method": "get_players"|"get_fixtures", "params": {...}}
   GET  /health — Health check.
 """
 
+import asyncio
 import json
 import os
 from typing import Any, Dict, List
 
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
-
-from mcp.server.fastmcp import FastMCP  # type: ignore
+from fastapi.responses import JSONResponse
+from sse_starlette.sse import EventSourceResponse, ServerSentEvent  # type: ignore
 
 app = FastAPI(title="Fantasy PL MCP Server")
 
-# Create FastMCP server
-mcp = FastMCP(name="fantasy-pl")
 
-
-@mcp.tool(name="get_players", description="Get FPL players (placeholder)")
+# Placeholder tool implementations
 async def get_players() -> List[Dict[str, Any]]:
-    # Placeholder - will be replaced with real FPL API calls
+    # TODO: replace with real FPL API calls
     return [{"id": 1, "name": "Placeholder Player"}]
 
 
-@mcp.tool(name="get_fixtures", description="Get FPL fixtures (placeholder)")
 async def get_fixtures() -> List[Dict[str, Any]]:
+    # TODO: replace with real FPL API calls
     return [{"id": 1, "event": 1, "kickoff_time": "2026-08-17T15:00:00Z"}]
 
 
@@ -42,23 +36,50 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/sse")
-async def sse_endpoint(request: Request) -> StreamingResponse:
+async def sse_endpoint(request: Request) -> EventSourceResponse:
+    """
+    SSE stream that periodically sends MCP-style messages.
+    For now, it sends a simple heartbeat; you can extend this to push updates.
+    """
+
     async def event_generator():
-        async with mcp.sse_stream() as stream:
-            async for event in stream:
-                yield f"event: message\ndata: {json.dumps(event)}\n\n"
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-    )
+        while True:
+            # Send a simple MCP-like message every 10 seconds
+            msg = {"jsonrpc": "2.0", "method": "ping", "params": {}}
+            yield ServerSentEvent(data=json.dumps(msg), event="message")
+            await asyncio.sleep(10)
+
+    return EventSourceResponse(event_generator())
 
 
 @app.post("/mcp")
 async def mcp_endpoint(request: Request) -> JSONResponse:
-    body = await request.json()
-    result = await mcp.handle_json_rpc(body)
-    return JSONResponse(result)
+    """
+    Simple JSON-RPC handler for MCP tools.
+    Body: {"method": "get_players"|"get_fixtures", "params": {...}, "id": 1}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}, "id": None},
+            status_code=400,
+        )
+
+    method = body.get("method")
+    call_id = body.get("id", 1)
+
+    if method == "get_players":
+        result = await get_players()
+        return JSONResponse({"jsonrpc": "2.0", "result": result, "id": call_id})
+    elif method == "get_fixtures":
+        result = await get_fixtures()
+        return JSONResponse({"jsonrpc": "2.0", "result": result, "id": call_id})
+    else:
+        return JSONResponse(
+            {"jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}, "id": call_id},
+            status_code=404,
+        )
 
 
 def main():
