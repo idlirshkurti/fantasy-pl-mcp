@@ -1,5 +1,6 @@
 FROM python:3.11-slim
 
+# Cache-bust: 2026-08-17 force rebuild
 WORKDIR /app
 
 # Install system deps if needed (none required for this simple app)
