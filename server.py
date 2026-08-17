@@ -1,16 +1,18 @@
 """
-MCP HTTP/SSE server for Fantasy PL with plain FastAPI + sse_starlette.
+MCP HTTP/SSE server that proxies to a local fpl_mcp subprocess.
 
 Endpoints:
-  GET  /sse    — Server-Sent Events stream (MCP-style messages).
-  POST /mcp    — JSON-RPC: initialize, tools/list, tools/call, etc.
+  GET  /sse    — Simple SSE heartbeat (can be extended).
+  POST /mcp    — JSON-RPC proxy to python -m fpl_mcp (stdio).
   GET  /health — Health check.
 """
 
 import asyncio
 import json
 import os
-from typing import Any, Dict, List
+import subprocess
+import sys
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -18,31 +20,32 @@ from sse_starlette.sse import EventSourceResponse, ServerSentEvent  # type: igno
 
 app = FastAPI(title="Fantasy PL MCP Server")
 
-
-# Tool implementations
-async def get_players() -> List[Dict[str, Any]]:
-    # TODO: replace with real FPL API calls
-    return [{"id": 1, "name": "Placeholder Player"}]
+# Global subprocess handle
+fpl_proc: Optional[subprocess.Popen] = None
 
 
-async def get_fixtures() -> List[Dict[str, Any]]:
-    # TODO: replace with real FPL API calls
-    return [{"id": 1, "event": 1, "kickoff_time": "2026-08-17T15:00:00Z"}]
+def start_fpl_subprocess():
+    global fpl_proc
+    # Start the MCP server from the installed fork
+    fpl_proc = subprocess.Popen(
+        [sys.executable, "-m", "fpl_mcp"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
 
 
-# MCP tool definitions
-TOOLS = [
-    {
-        "name": "get_players",
-        "description": "Get all FPL players with stats",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "get_fixtures",
-        "description": "Get FPL fixtures",
-        "inputSchema": {"type": "object", "properties": {}},
-    },
-]
+@app.on_event("startup")
+async def startup_event():
+    start_fpl_subprocess()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if fpl_proc is not None:
+        fpl_proc.terminate()
 
 
 @app.get("/health")
@@ -62,6 +65,12 @@ async def sse_endpoint(request: Request) -> EventSourceResponse:
 
 @app.post("/mcp")
 async def mcp_endpoint(request: Request) -> JSONResponse:
+    if fpl_proc is None:
+        return JSONResponse(
+            {"jsonrpc": "2.0", "error": {"code": -32603, "message": "Server not ready"}, "id": None},
+            status_code=503,
+        )
+
     try:
         body = await request.json()
     except Exception:
@@ -70,57 +79,28 @@ async def mcp_endpoint(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    method = body.get("method")
-    call_id = body.get("id", 1)
-    params = body.get("params", {})
+    # Write request to subprocess stdin
+    req_line = json.dumps(body) + "\n"
+    fpl_proc.stdin.write(req_line)
+    fpl_proc.stdin.flush()
 
-    # MCP handshake & tool discovery
-    if method == "initialize":
-        return JSONResponse({
-            "jsonrpc": "2.0",
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "serverInfo": {"name": "fantasy-pl", "version": "0.1.0"},
-                "capabilities": {"tools": {}},
-            },
-            "id": call_id,
-        })
+    # Read one response line from stdout
+    resp_line = fpl_proc.stdout.readline()
+    if not resp_line:
+        return JSONResponse(
+            {"jsonrpc": "2.0", "error": {"code": -32603, "message": "Subprocess error"}, "id": body.get("id", 1)},
+            status_code=500,
+        )
 
-    if method == "tools/list":
-        return JSONResponse({
-            "jsonrpc": "2.0",
-            "result": {"tools": TOOLS},
-            "id": call_id,
-        })
+    try:
+        resp = json.loads(resp_line)
+    except Exception:
+        return JSONResponse(
+            {"jsonrpc": "2.0", "error": {"code": -32603, "message": "Invalid response from subprocess"}, "id": body.get("id", 1)},
+            status_code=500,
+        )
 
-    if method == "tools/call":
-        tool_name = params.get("name")
-        if tool_name == "get_players":
-            result = await get_players()
-            return JSONResponse({
-                "jsonrpc": "2.0",
-                "result": {"content": [{"type": "text", "text": json.dumps(result)}]},
-                "id": call_id,
-            })
-        elif tool_name == "get_fixtures":
-            result = await get_fixtures()
-            return JSONResponse({
-                "jsonrpc": "2.0",
-                "result": {"content": [{"type": "text", "text": json.dumps(result)}]},
-                "id": call_id,
-            })
-        else:
-            return JSONResponse({
-                "jsonrpc": "2.0",
-                "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"},
-                "id": call_id,
-            }, status_code=400)
-
-    # Fallback for unknown methods
-    return JSONResponse(
-        {"jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}, "id": call_id},
-        status_code=404,
-    )
+    return JSONResponse(resp)
 
 
 def main():
